@@ -15,6 +15,9 @@ library(glmnet)
 library(pbmcapply)
 library(pROC)
 library(PRROC)
+library(pbmcapply)
+library(sparcl)
+
 
 writeReport <- function(txt, output = "report.txt"){
     ## character vector you want to add
@@ -156,14 +159,13 @@ eval_fold <- function(i) {
   pred <- as.integer(pr >= 0.5)
 
   data.table(
-    fold      = i,
-    auc_roc   = as.numeric(pROC::auc(tru, pr)),
-    auc_pr    = PRROC::pr.curve(scores.class0 = pr[tru == 1],
-                                scores.class1 = pr[tru == 0])$auc.integral,
-    logloss   = -mean(tru * log(pr) + (1 - tru) * log(1 - pr)),
-    accuracy  = mean(pred == tru)
+    fold_id = i,           # identifies which outer fold produced the row
+    row_id  = test[, .I],  # row index **within the original dt** (drop this if not needed)
+    tru     = tru,
+    pred    = pred
   )
 }
+
 
 # PREPARE DATA FOR MODELING
 prepare_dt <- function(dt){
@@ -177,4 +179,136 @@ prepare_dt <- function(dt){
   dt <- drop_bad_rows(dt)
   dt <- dt[, (names(dt)) := lapply(.SD, as.numeric), .SDcols = names(dt)]
   dt
+}
+
+
+# CALCULATE F1
+f1_from_dt <- function(dt) {
+  # fast 1-pass counts
+  cm <- dt[, .(
+    TP = sum(tru == 1 & pred == 1),
+    FP = sum(tru == 0 & pred == 1),
+    FN = sum(tru == 1 & pred == 0)
+  )]
+
+  with(cm, {
+    precision <- TP / (TP + FP)
+    recall    <- TP / (TP + FN)
+    f1        <- if (precision + recall == 0) NA_real_
+                 else 2 * precision * recall / (precision + recall)
+
+    data.table(precision, recall, f1)
+  })
+}
+
+
+# REMOVE ZERO VARIANCE COLUMNS
+remove_zero_var <- function(dt){
+  nzv_idx   <- nearZeroVar(dt)          # dt is your data.table / data.frame
+  nzv_names <- names(dt)[nzv_idx]       # column names with near-zero variance
+  dt[,(nzv_names):=NULL]
+}
+
+
+# CORRELATION MATRIX FILTER
+correlation_filter <- function(dt){
+
+  #dt[, (eventid):=NULL]
+  num_cols <- names(which(sapply(dt, is.numeric)))        # keep only numerics
+  #num_cols <- setdiff(num_cols, 'eventid') # leave eventid out cause it's highly correlated with year
+  corr_mat <- cor(dt[, ..num_cols], use = "pairwise.complete.obs")
+
+  # Drop one variable from every pair with |r| ≥ 0.90
+  high_corr_idx   <- findCorrelation(corr_mat, cutoff = 0.90, verbose = TRUE)
+  high_corr_names <- num_cols[high_corr_idx]
+
+  dt[, !high_corr_names, with = FALSE]              # in-place removal
+}
+
+
+prep_for_clustering <- function(dt,
+                          nzv_cut   = .95,   # drop if >95 % identical values
+                          corr_cut  = .90) { # drop one of any |r| > .9 pair
+  dt <- remove_neg9_features(dt)
+  dt <- drop_sparse_strings(dt)
+  
+  # keep only numeric for distance-based clustering
+  num_cols <- names(which(sapply(dt, is.numeric)))
+  dt_num   <- dt[, ..num_cols]
+  
+  ## 1A. near-zero variance
+  idx_nzv <- nearZeroVar(dt_num, freqCut = 95/5, uniqueCut = nzv_cut * 100)
+  if (length(idx_nzv)) dt_num <- dt_num[, -idx_nzv, with = FALSE]
+  
+  ## 1B. high pairwise correlation
+  R       <- cor(dt_num, use = "pairwise.complete.obs")
+  idx_cor <- findCorrelation(R, cutoff = corr_cut)
+  if (length(idx_cor)) dt_num <- dt_num[, -idx_cor, with = FALSE]
+
+  dt <- na.omit(dt)
+  dt <- drop_bad_rows(dt)
+  
+  ## 1C. scale for clustering
+  as.matrix(scale(dt_num))
+}
+library(data.table)
+
+
+prep_numeric_matrix <- function(dt) {
+  # 1. keep only numeric columns
+  num_cols <- names(which(sapply(dt, is.numeric)))
+  Xdt      <- copy(dt)[, ..num_cols]
+
+  # 2. drop columns that are *all* NA  ------------------------------
+  all_na   <- names(which(colSums(!is.finite(as.matrix(Xdt))) == nrow(Xdt)))
+  if (length(all_na)) Xdt[, (all_na) := NULL]
+
+  # 3. drop zero-variance columns *before* scaling -----------------
+  zero_sd  <- names(which(sapply(Xdt, function(x)
+                       var(x, na.rm = TRUE) == 0 | all(is.na(x)))))
+  if (length(zero_sd)) Xdt[, (zero_sd) := NULL]
+
+  # 4. optional: impute remaining NAs (rf-based missRanger is fast)
+  #   library(missRanger)
+  #   Xdt <- missRanger(Xdt, pmm.k = 3, seed = 1)
+
+  # 5. scale & final sanity check ----------------------------------
+  X <- scale(as.matrix(Xdt))
+
+
+  X
+}
+
+
+
+
+
+
+permute_sparsek <- function(X, K,
+                            nperms   = 30,
+                            wbounds  = NULL,   # let sparcl choose a grid
+                            nstart   = 20,
+                            seed     = 1,
+                            cores    = detectCores() - 2) {
+
+  ## (a) parallel permutation fits
+  perm_gap <- pbmclapply(
+    X = seq_len(nperms),
+    mc.cores = cores,
+    FUN = function(i) {
+      set.seed(seed + i)
+      Xperm <- apply(X, 2, sample)                    # column-wise shuffle
+      fit   <- KMeansSparseCluster(Xperm, K = K,
+                                   wbounds = wbounds,
+                                   nstart  = nstart,
+                                   silent  = TRUE)
+      max(fit[[1]]$gaps)                              # return gap for this λ
+    }
+  )
+
+  ## (b) best λ = wbounds value that maximises mean gap over permutations
+  gap_vec <- unlist(perm_gap, use.names = FALSE)
+  best_w  <- wbounds[ which.max(gap_vec) ]
+
+  list(bestw = best_w, gaps = gap_vec)
 }

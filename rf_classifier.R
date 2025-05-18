@@ -1,27 +1,35 @@
     # ========================================= #
     #       BUILD A RANDOM FOREST CLASSIFER     #
     # ========================================= #
+setwd("/sc/arion/projects/va-biobank/PROJECTS/ma_extras/personal/gtd/gtd")
+source("classification_helper.R")
 library(data.table)
 library(ranger)         # fast RF
 library(pbmcapply)      # parallel lapply
 library(pROC)           # AUC-ROC
 library(PRROC)          # AUC-PR
+dt <- fread('Resources/globalterrorismdb.csv')
+backup <- copy(dt)
 
 ## ──────────────────────────────────────────────────────────────
 ## 0.  data prep  (your existing helpers) -----------------------
 dt <- copy(backup)          # full GTD slice
-dt <- prepare_dt(dt)
-dt
-y         <- "doubtterr"                 # 0 / 1
+y         <- "doubtterr"                 
 pred_cols <- c(
   "weapsubtype1", "targtype1_txt", "targsubtype1",
   "natlty1", "property"
 )
 
+dt <- dt[, c(y, pred_cols), with = FALSE]
+dt <- prepare_dt(dt)
+
+
+
 ## ──────────────────────────────────────────────────────────────
 ## 1.  outer 10-fold, stratified on y ---------------------------
 k_outer <- 10
 set.seed(1)
+
 dt[, fold := { idx <- sample(.N)
                rep(seq_len(k_outer), length.out = .N)[order(idx)] },
    by = doubtterr]
@@ -43,31 +51,44 @@ grid <- unique(grid[mtry <= p])
 
 ## ──────────────────────────────────────────────────────────────
 ## 4.  run outer CV in parallel --------------------------------
-results <- rbindlist(
-  pbmclapply(seq_len(k_outer), eval_fold,
-             mc.cores = parallel::detectCores() - 1)
+unique(dt$doubtterr)
+
+all_results <- rbindlist(
+  lapply(seq_len(k_outer), eval_fold)
 )
-fwrite(results, 'final_results.csv')
+fwrite(all_results, 'rf/final_results.csv')
+results[fold_id == 1,]
+nrow(all_results)
+
 
 ## ──────────────────────────────────────────────────────────────
-## 5.  aggregate performance -----------------------------------
-summary <- results[, .(
+## 5.  calculate performance ------------------------------------
+performance_results <- all_results[,.(
+    auc_roc   = as.numeric(pROC::auc(tru, pred)),
+    auc_pr    = PRROC::pr.curve(scores.class0 = pred[tru == 1],
+                                scores.class1 = pred[tru == 0])$auc.integral,
+    logloss   = -mean(tru * log(pred) + (1 - tru) * log(1 - pred)),
+    accuracy  = mean(pred == tru)),
+    by = fold_id]
+fwrite(performance_results, 'rf/performance_results.csv')
+
+
+## ──────────────────────────────────────────────────────────────
+## 6.  aggregate performance -----------------------------------
+summary <- performance_results[, .(auc_roc, auc_pr,logloss,accuracy)][, .(
   mean_auc_roc = mean(auc_roc), sd_auc_roc = sd(auc_roc),
   mean_auc_pr  = mean(auc_pr),  sd_auc_pr  = sd(auc_pr),
   mean_logloss = mean(logloss), sd_logloss = sd(logloss),
   mean_acc     = mean(accuracy),sd_acc     = sd(accuracy)
 )]
 print(summary)
-fwrite(summary, 'final_model_summary.csv')
+fwrite(summary, 'rf/final_model_summary.csv')
 
 
-   mean_auc_roc sd_auc_roc mean_auc_pr   sd_auc_pr mean_logloss sd_logloss
-          <num>      <num>       <num>       <num>        <num>      <num>
-1:    0.9533981 0.00338798    0.869247 0.006087762          NaN         NA
-    mean_acc      sd_acc
-       <num>       <num>
-1: 0.9404722 0.002079409
+## ──────────────────────────────────────────────────────────────
+## 7.   calculate F1
+f1 <- f1_from_dt(all_results[, .(tru,pred), by= fold_id])
 
-
+fwrite(f1, 'rf/f1_score.csv')
 
 

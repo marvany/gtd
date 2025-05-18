@@ -1,24 +1,17 @@
-library(data.table)
-
-
-
-names(dt)
-
-
-
-############################################################
+###########################################################
 #  GTD feature-triage template
 #  ---------------------------------------------------------
 #  • Assumes your data.frame/data.table is called  dt
 #  • Pick your target in the  target  variable
 #  • Requires: data.table, ranger, vip, mltools, forcats
 ############################################################
-source("C:\\Users\\Marios\\Documents\\2023-2024\\Business\\eirini_marios\\gtd\\classification_helper.R")
+setwd("/sc/arion/projects/va-biobank/PROJECTS/ma_extras/personal/gtd/gtd")
+source("classification_helper.R")
 
 ## -------- 0.  SET-UP  ----------------------------------------------------
+setDTthreads(max(1L, parallel::detectCores() - 1))
 dt = fread('Resources/globalterrorismdb.csv')
 backup <- copy(dt)
-setDTthreads(max(1L, parallel::detectCores() - 1))
 
 
 ## -------- 1.  TRIAGE / QUICK PROFILE  ------------------------------------
@@ -109,24 +102,13 @@ dt[, (char_cols) := lapply(.SD, function(x) as.integer(factor(x, levels = unique
 
 
 #--------- 6. Filter out columns with near 0 variance
-nzv_idx   <- nearZeroVar(dt)          # dt is your data.table / data.frame
-nzv_names <- names(dt)[nzv_idx]       # column names with near-zero variance
-dt[,(nzv_names):=NULL]
+dt <- remove_zero_var(dt)
 
 sort(names(dt))
 
 #--------- 7. Pairwise-correlation filter (fast, numeric columns only)
-# Build correlation matrix
-dt[, (eventid):=NULL]
-num_cols <- names(which(sapply(dt, is.numeric)))        # keep only numerics
-#num_cols <- setdiff(num_cols, 'eventid') # leave eventid out cause it's highly correlated with year
-corr_mat <- cor(dt[, ..num_cols], use = "pairwise.complete.obs")
+dt <- correlation_filter(dt)
 
-# Drop one variable from every pair with |r| ≥ 0.90
-high_corr_idx   <- findCorrelation(corr_mat, cutoff = 0.90, verbose = TRUE)
-high_corr_names <- num_cols[high_corr_idx]
-
-dt <- dt[, !high_corr_names, with = FALSE]              # in-place removal
 sort(names(dt))
 
 
@@ -216,7 +198,6 @@ ord_vars <- ord_vars[1:10] # we keep only the first 10
 
 ####################################################################################
 ####################################################################################
-
 
 
 set.seed(123)
