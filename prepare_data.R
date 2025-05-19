@@ -82,8 +82,8 @@ dt <- copy(backup)
 #-------- 2. Remove columns with >30 % missing
 drop_cols <- profile[pct_missing > 50, variable]
 dt[, (drop_cols) := NULL]
-text = paste("SIMILARLY TO WHAT WE DID BEFORE WE FILTER OUT VARIABLES WHOSE MISSING VALUES ARE >50% OF OUR TOTAL DATASET.")
-writeReport(text)
+#text = paste("SIMILARLY TO WHAT WE DID BEFORE WE FILTER OUT VARIABLES WHOSE MISSING VALUES ARE >50% OF OUR TOTAL DATASET.")
+#writeReport(text)
 
 
 #--------- 3. HANDLE -9 VALUES and ''; a. remove features with many -9
@@ -101,17 +101,15 @@ dt[, (char_cols) := lapply(.SD, function(x) as.integer(factor(x, levels = unique
 
 
 
+
 #--------- 6. Filter out columns with near 0 variance
 dt <- remove_zero_var(dt)
 
-sort(names(dt))
 
 #--------- 7. Pairwise-correlation filter (fast, numeric columns only)
 dt <- correlation_filter(dt)
 
-sort(names(dt))
-
-
+if(FALSE){
 #--------- 8. Filter out high VIF 
 # make sure all are numeric
 dt[, (names(dt)) := lapply(.SD, as.numeric), .SDcols = names(dt)]
@@ -131,17 +129,70 @@ mod <- lm(form, data = as.data.frame(na.omit(m)), family = 'poisson')   # target
 vif_vals <- vif(mod)                              # named numeric vector
 too_high  <- names(vif_vals[vif_vals > 10])
 too_high
-dt <- dt[, (eventid):=NULL]
+}
 
 
 
 
 #-------- 9. Regularize
+# First we restore all 
+cols_to_keep <- names(dt)
+id_to_keep <- dt$eventid
+fwrite(data.table(eventid = id_to_keep), 'data_inspection/ids_of_rows_considered.csv')
 
-ycol = "doubtterr"
-xmat <- scale(dt[, setdiff(names(dt), ycol), with = FALSE])
+
+temp <- copy(backup)
+temp <- temp[, ..cols_to_keep]
+temp <- temp[eventid %in% id_to_keep]
+dim(temp)
+dim(dt)
+dt <- copy(temp)
+
+class_dt <- data.table(
+  variable = names(dt),
+  class    = vapply(dt, function(x) paste(class(x), collapse = ", "), character(1L))
+)
+class_dt
+
+
+char_cols <- names(which(sapply(dt, is.character)))
+dt[, (char_cols) := lapply(.SD, as.factor), .SDcols = char_cols]
+
+# 
+class_dt <- data.table(
+  variable = names(dt),
+  class    = vapply(dt, function(x) paste(class(x), collapse = ", "), character(1L))
+)
+class_dt
+
+insp.dt = data.table(
+  variable = names(dt),
+  n_unique = vapply(dt, uniqueN, integer(1L)),
+  class = vapply(dt, function(x) paste(class(x), sep = ", "), character(1L))
+)
+insp.dt
+
+# WE FILTER OUT VARIABLES WITH MORE THAN 40 UNIQUE VALUES FOR COMPUATIONAL SIMPLICITY
+to_keep = c(insp.dt[n_unique < 40, variable])
+dt <- dt[, ..to_keep]
+
+data.table(
+  variable = names(dt),
+  n_unique = vapply(dt, uniqueN, integer(1L)),
+  class = vapply(dt, class, character(1L))
+)
+
+# Build xmat
+xmat <- build_xmat(dt)
+
+# Build yvec
 yvec <- scale(dt[[ycol]])
+yvec <- -yvec
+
+# Build lambda
 lambda_grid <- 10^seq(1, -6, length.out = 400)     # 10¹ … 10⁻⁶
+fwrite(cbind(yvec, xmat), 'data_inspection/final_predictors_considered.csv') # V1 is the doubterr variable
+
 
 fit <- glmnet(
   x               = xmat,
@@ -191,8 +242,15 @@ print(abs(sel_beta[order(-abs(sel_beta))]))
 ord_vars <- abs(sel_beta[order(-abs(sel_beta))])
 ord_vars <- setdiff(names(ord_vars), c('crit3', 'gname')) # we remove these because they will introduce bias
 ord_vars
-ord_vars <- ord_vars[1:10] # we keep only the first 10
 
+writeLines(ord_vars, 'data_inspection/top_20_predictors.csv')
+#ord_vars <- ord_vars[1:10] # we keep only the first 10
+
+"after inspecting the ordered variables we see that targtype1_txt , region_txt , dbsource , weapsubtype1_txt , INT_MISC ,
+multiple"
+
+# these are the broader variables categories
+vars_selected <- c('targtype1_txt' , 'region_txt' , 'dbsource' , 'weapsubtype1_txt' , 'INT_MISC' ,'multiple')
 
 
 

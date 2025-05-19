@@ -110,6 +110,7 @@ eval_fold <- function(i) {
 
   grid$score <- pbmclapply(
     seq_len(nrow(grid)),
+    mc.cores = parallel::detectCores() - 1,
     function(g) {
       hp <- grid[g]
       auc_inner <- numeric(k_inner)
@@ -117,7 +118,6 @@ eval_fold <- function(i) {
       for (j in seq_len(k_inner)) {
         tr_in  <- train[inner != j]
         val_in <- train[inner == j]
-
         rf <- ranger(
           formula   = doubtterr ~ .,
           data      = tr_in[, c(y, pred_cols), with = FALSE],
@@ -132,11 +132,10 @@ eval_fold <- function(i) {
 
         pr <- predict(rf,
           data = val_in[, c(y, pred_cols), with = FALSE])$predictions[, 2]
-        auc_inner[j] <- as.numeric(pROC::auc(val_in[[y]], pr))
+        auc_inner[j] <- as.numeric(pROC::auc(val_in[[y]], pr, quiet = TRUE))
       }
       mean(auc_inner)
-    },
-    mc.cores = parallel::detectCores() - 1
+    }
   )
 
   best_hp <- grid[which.max(unlist(grid$score))]
@@ -183,19 +182,6 @@ prepare_dt <- function(dt){
   dt
 }
 
-# PREPARE DATA FOR CLUSTER
-prepare_dt_clustering <- function(dt){
-  dt <- remove_neg9_features(dt)
-  dt <- drop_sparse_strings(dt)
-  char_cols <- names(which(sapply(dt, is.character)))
-  dt[, (char_cols) := lapply(.SD, function(x) as.integer(factor(x, levels = unique(x)))), 
-    .SDcols = char_cols]
-
-  dt <- na.omit(dt)
-  dt <- drop_bad_rows(dt)
-  dt <- dt[, (names(dt)) := lapply(.SD, as.numeric), .SDcols = names(dt)]
-  dt
-}
 
 # CALCULATE F1
 f1_from_dt <- function(dt) {
@@ -226,18 +212,16 @@ remove_zero_var <- function(dt){
 
 
 # CORRELATION MATRIX FILTER
-correlation_filter <- function(dt){
+correlation_filter <- function(dt) {
 
-  #dt[, (eventid):=NULL]
-  num_cols <- names(which(sapply(dt, is.numeric)))        # keep only numerics
-  #num_cols <- setdiff(num_cols, 'eventid') # leave eventid out cause it's highly correlated with year
+  num_cols <- names(which(sapply(dt, is.numeric)))       # numeric columns
   corr_mat <- cor(dt[, ..num_cols], use = "pairwise.complete.obs")
 
-  # Drop one variable from every pair with |r| ≥ 0.90
+  # variables with |r| ≥ 0.90
   high_corr_idx   <- findCorrelation(corr_mat, cutoff = 0.90, verbose = TRUE)
-  high_corr_names <- num_cols[high_corr_idx]
+  high_corr_names <- setdiff(num_cols[high_corr_idx], "eventid")   # keep eventid
 
-  dt[, !high_corr_names, with = FALSE]              # in-place removal
+  dt[, !high_corr_names, with = FALSE]                   # return filtered table
 }
 
 
@@ -326,4 +310,54 @@ permute_sparsek <- function(X, K,
   best_w  <- wbounds[ which.max(gap_vec) ]
 
   list(bestw = best_w, gaps = gap_vec)
+}
+
+
+
+
+
+build_xmat <- function(dt, ycol = "doubtterr", sparse = FALSE) {
+  library(data.table)
+  library(Matrix)      # for sparse.model.matrix()
+  
+  dt <- copy(dt)       # keep caller’s object untouched
+  
+  ## 1. identify column groups ------------------------------------------
+  cat_cols <- setdiff(
+    names(dt)[vapply(dt, function(x) is.character(x) || is.factor(x), logical(1L))],
+    ycol
+  )
+  num_cols <- setdiff(
+    names(dt)[vapply(dt, is.numeric, logical(1L))],
+    ycol
+  )
+  
+  ## 2. scale numeric predictors ----------------------------------------
+  X_num <- if (length(num_cols)) scale(as.matrix(dt[, ..num_cols])) else NULL
+  
+  ## 3. one-hot encode categorical predictors ---------------------------
+  if (length(cat_cols)) {
+    dt[, (cat_cols) := lapply(.SD, as.factor), .SDcols = cat_cols]   # chars → factors
+    X_cat <- if (sparse) {
+      sparse.model.matrix(~ . - 1, data = dt[, ..cat_cols])
+    } else {
+      model.matrix(~ . - 1, data = dt[, ..cat_cols])
+    }
+  } else {
+    X_cat <- NULL
+  }
+  
+  ## 4. bind and return --------------------------------------------------
+  if (is.null(X_num)) return(X_cat)
+  if (is.null(X_cat)) return(X_num)
+  cbind(X_num, X_cat)
+}
+
+
+
+safe_names <- function(x) {
+  x <- gsub("[^[:alnum:]_]", "_", x)    # anything not letter/number/_  → _
+  x <- gsub("^([0-9])", "X\\1", x)      # names can’t start with a digit
+  x <- gsub("_+", "_", x)               # collapse multiple underscores
+  make.unique(x, sep = "_")             # guarantee uniqueness
 }
