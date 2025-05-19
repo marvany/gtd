@@ -17,6 +17,8 @@ library(pROC)
 library(PRROC)
 library(pbmcapply)
 library(sparcl)
+library(cluster)
+library(fpc)
 
 
 writeReport <- function(txt, output = "report.txt"){
@@ -181,6 +183,19 @@ prepare_dt <- function(dt){
   dt
 }
 
+# PREPARE DATA FOR CLUSTER
+prepare_dt_clustering <- function(dt){
+  dt <- remove_neg9_features(dt)
+  dt <- drop_sparse_strings(dt)
+  char_cols <- names(which(sapply(dt, is.character)))
+  dt[, (char_cols) := lapply(.SD, function(x) as.integer(factor(x, levels = unique(x)))), 
+    .SDcols = char_cols]
+
+  dt <- na.omit(dt)
+  dt <- drop_bad_rows(dt)
+  dt <- dt[, (names(dt)) := lapply(.SD, as.numeric), .SDcols = names(dt)]
+  dt
+}
 
 # CALCULATE F1
 f1_from_dt <- function(dt) {
